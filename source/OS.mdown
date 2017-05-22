@@ -1,0 +1,1090 @@
+# 物理内存管理机制
+[TOC]
+
+## 两个关键的全局变量
+
+```
+/kern/mm/default_pmm.h
+extern const struct pmm_manager default_pmm_manager;
+extern free_area_t free_area;
+```
+
+### pmm_manager
+
+```
+/kern/mm/pmm.h
+struct pmm_manager {
+    const char *name;                                 // XXX_pmm_manager's name
+    void (*init)(void);                               // initialize internal description&management data structure
+                                                      // (free block list, number of free block) of XXX_pmm_manager 
+    void (*init_memmap)(struct Page *base, size_t n); // setup description&management data structcure according to
+                                                      // the initial free physical memory space 
+    struct Page *(*alloc_pages)(size_t n);            // allocate >=n pages, depend on the allocation algorithm 
+    void (*free_pages)(struct Page *base, size_t n);  // free >=n pages with "base" addr of Page descriptor structures(memlayout.h)
+    size_t (*nr_free_pages)(void);                    // return the number of free pages 
+    void (*check)(void);                              // check the correctness of XXX_pmm_manager 
+};
+```
+
+* name：物理内存管理器的名字
+* init：初始化free_area
+* init_memmap：初始化物理内存空间
+* alloc_pages：分配物理内存页
+* free_pages：释放物理内存页
+* nr_free_pages：返回空闲页数
+* check：功能测试
+
+在/kern/mm/default_pmm.c完成赋值
+
+```
+/kern/mm/default_pmm.c
+const struct pmm_manager default_pmm_manager = {
+    .name = "default_pmm_manager",
+    .init = default_init,
+    .init_memmap = default_init_memmap,
+    .alloc_pages = default_alloc_pages,
+    .free_pages = default_free_pages,
+    .nr_free_pages = default_nr_free_pages,
+    .check = default_check,
+};
+```
+
+### free_area_t
+
+```
+/kern/mm/pmm.h
+typedef struct {
+    list_entry_t free_list;         // the list header
+    unsigned int nr_free;           // # of free pages in this free list
+} free_area_t;
+```
+
+两个宏
+
+```
+/kern/mm/default_pmm.c
+#define free_list (free_area.free_list)
+#define nr_free (free_area.nr_free)
+```
+
+## 深入default_pmm
+
+1. page
+
+    ```
+    struct Page {
+        int ref;                        // page frame's reference counter
+        uint32_t flags;                 // array of flags that describe the status of the page frame
+        unsigned int property;          // the num of free block, used in first fit pm manager
+        list_entry_t page_link;         // free list link
+        list_entry_t pra_page_link;     // used for pra (page replace algorithm)
+        uintptr_t pra_vaddr;            // used for pra (page replace algorithm)
+    };
+    ```
+
+2. 初始化
+
+    从base的地址开始，顺序初始化n个页，地址是连续的。
+    有两种方式初始化，一种是只在free_list上添加连续空闲页的第一个页，另一种是将所有空闲页添加在free_list上。这两种方式会影响到分配代码和释放代码。此处为前者。
+
+    ```
+    static void
+    default_init_memmap(struct Page *base, size_t n) {
+        assert(n > 0);
+        struct Page *p = base;
+        for (; p != base + n; p ++) {
+            assert(PageReserved(p));    //确认页未被内核占有
+            p->flags = 0；       
+            p->property = 0;
+            set_page_ref(p, 0);
+        }
+        base->property = n;
+        SetPageProperty(base);
+        nr_free += n;
+        list_add(&free_list, &(base->page_link));   //链表连续空闲页的第一个页
+    }
+    ```
+
+3. 分配页
+    
+    此处使用的算法是first fit。
+
+    ```
+    static struct Page *
+    default_alloc_pages(size_t n) {
+        assert(n > 0);
+        //需求大于空闲，非法
+        if (n > nr_free) {
+            return NULL;
+        }
+        struct Page *page = NULL;
+        list_entry_t *le = &free_list;
+        //遍历空闲页链表
+        //找到第一个满足first fit的空间
+        while ((le = list_next(le)) != &free_list) {
+            struct Page *p = le2page(le, page_link);
+            if (p->property >= n) {
+                page = p;
+                break;
+            }
+        }
+        //找到满足的空间
+        //将分配后剩余的空闲页添加到链表
+        if (page != NULL) {
+            list_del(&(page->page_link));
+            if (page->property > n) {
+                struct Page *p = page + n;
+                p->property = page->property - n;
+                SetPageProperty(p);
+                list_add(list_prev(le), &(p->page_link));
+            }
+            nr_free -= n;
+            ClearPageProperty(page);
+        }
+        return page;
+    }
+    ```
+
+4. 释放页
+
+    传入释放**页的基地址**和**页的个数**
+
+    ```
+    static void
+    default_free_pages(struct Page *base, size_t n) {
+        assert(n > 0);
+        struct Page *p = base;
+        //判断释放的空间是否合法
+        for (; p != base + n; p ++) {
+            assert(!PageReserved(p) && !PageProperty(p));
+            p->flags = 0;
+            set_page_ref(p, 0);
+        }
+        //恢复base所表示空间的大小
+        base->property = n;
+        SetPageProperty(base);
+        list_entry_t *le = &free_list;
+        //遍历空闲页链表，与前后空闲页空间合并
+        while ((le = list_next(le)) != &free_list) {
+            p = le2page(le, page_link);
+            //与前空闲页合并
+            //删除链表中的前空闲页
+            if (p + p->property == base) {
+                p->property += base->property;
+                ClearPageProperty(base);
+                base = p;
+                list_del(&(p->page_link));
+            }
+            //与后空闲页合并
+            //删除链表中的后空闲页
+            else if (base + base->property == p) {
+                base->property += p->property;
+                ClearPageProperty(p);
+                list_del(&(p->page_link));
+            }
+        }
+        //此时base指向合并后空间的开始处
+        //找到链表中在base之后（不能和其合并）的空闲页entry
+        while ((le = list_next(le)) != &free_list) {
+            p = le2page(le, page_link);
+            if (p > base) break;
+        }
+        //将最终的页添加至链表
+        list_add_before(le, &(base->page_link));
+        nr_free += n;
+    }
+    ```
+
+## pmm流程分析
+
+```
+void
+pmm_init(void) {
+    //We need to alloc/free the physical memory (granularity is 4KB or other size). 
+    //So a framework of physical memory manager (struct pmm_manager)is defined in pmm.h
+    //First we should init a physical memory manager(pmm) based on the framework.
+    //Then pmm can alloc/free the physical memory. 
+    //Now the first_fit/best_fit/worst_fit/buddy_system pmm are available.
+    init_pmm_manager();    
+
+    // detect physical memory space, reserve already used memory,
+    // then use pmm->init_memmap to create free page list
+    page_init();    
+
+    //use pmm->check to verify the correctness of the alloc/free function in a pmm
+    check_alloc_page();    
+
+    // create boot_pgdir, an initial page directory(Page Directory Table, PDT)
+    boot_pgdir = boot_alloc_page();
+    memset(boot_pgdir, 0, PGSIZE);
+    boot_cr3 = PADDR(boot_pgdir);    
+    check_pgdir();    
+    static_assert(KERNBASE % PTSIZE == 0 && KERNTOP % PTSIZE == 0); 
+
+    // recursively insert boot_pgdir in itself
+    // to form a virtual page table at virtual address VPT
+    boot_pgdir[PDX(VPT)] = PADDR(boot_pgdir) | PTE_P | PTE_W;    
+
+    // map all physical memory to linear memory with base linear addr KERNBASE
+    //linear_addr KERNBASE~KERNBASE+KMEMSIZE = phy_addr 0~KMEMSIZE
+    //But shouldn't use this map until enable_paging() & gdt_init() finished.
+    boot_map_segment(boot_pgdir, KERNBASE, KMEMSIZE, 0, PTE_W);    
+
+    //temporary map: 
+    //virtual_addr 3G~3G+4M = linear_addr 0~4M = linear_addr 3G~3G+4M = phy_addr 0~4M     
+    boot_pgdir[0] = boot_pgdir[PDX(KERNBASE)];    
+    enable_paging();    
+
+    //reload gdt(third time,the last time) to map all physical memory
+    //virtual_addr 0~4G=liear_addr 0~4G
+    //then set kernel stack(ss:esp) in TSS, setup TSS in gdt, load TSS
+    gdt_init();    
+
+    //disable the map of virtual_addr 0~4M
+    boot_pgdir[0] = 0;    
+
+    //now the basic virtual memory map(see memalyout.h) is established.
+    //check the correctness of the basic virtual memory map.
+    check_boot_pgdir();    
+    print_pgdir();
+    
+    kmalloc_init();}
+```
+
+1. init_pmm_manager()
+
+    建立物理内存管理机制
+    ```
+    init_pmm_manager(void) {
+        pmm_manager = &default_pmm_manager;
+        cprintf("memory management: %s\n", pmm_manager->name);
+        pmm_manager->init();
+    }
+    ```
+
+2. page_init()
+    
+    探测物理内存分布和大小之后，基于e820map进行页初始化，但未进行地址映射
+    最终将page结构占用空间内的所有page结构加入到free_list链表中
+
+    ```
+    static void
+    page_init(void) {
+        struct e820map *memmap = (struct e820map *)(0x8000 + KERNBASE);
+        uint64_t maxpa = 0;
+        cprintf("e820map:\n");
+        int i;
+        for (i = 0; i < memmap->nr_map; i ++) {
+            uint64_t begin = memmap->map[i].addr, end = begin + memmap->map[i].size;
+            cprintf("  memory: %08llx, [%08llx, %08llx], type = %d.\n",
+                    memmap->map[i].size, begin, end - 1, memmap->map[i].type);
+            if (memmap->map[i].type == E820_ARM) {
+                if (maxpa < end && begin < KMEMSIZE) {
+                    maxpa = end;
+                }
+            }
+        }
+        if (maxpa > KMEMSIZE) {
+            maxpa = KMEMSIZE;
+        }        extern char end[];
+        npage = maxpa / PGSIZE;
+        pages = (struct Page *)ROUNDUP((void *)end, PGSIZE);
+        
+        //page结构占有的空间不能被分配
+        for (i = 0; i < npage; i ++) {
+            SetPageReserved(pages + i);
+        }        
+        uintptr_t freemem = PADDR((uintptr_t)pages + sizeof(struct Page) * npage);        
+        for (i = 0; i < memmap->nr_map; i ++) {
+            uint64_t begin = memmap->map[i].addr, end = begin + memmap->map[i].size;
+            if (memmap->map[i].type == E820_ARM) {
+                if (begin < freemem) {
+                    begin = freemem;
+                }
+                if (end > KMEMSIZE) {
+                    end = KMEMSIZE;
+                }
+                if (begin < end) {
+                    begin = ROUNDUP(begin, PGSIZE);
+                    end = ROUNDDOWN(end, PGSIZE);
+                    if (begin < end) {
+                        init_memmap(pa2page(begin), (end - begin) / PGSIZE);
+                    }
+                }
+            }
+        }
+    }
+    ```
+
+    * maxpa：最大的物理内存地址
+    * end：ucore结束地址
+    * npage：需要的page的个数
+    * sizeof(struct Page) * npage)：page这个struct所需要的空间大小
+    * pages = (struct Page *)ROUNDUP((void *)end, PGSIZE)：Page结构的内存空间起始地址
+    * freemem：空闲空间开始地址
+    * init_memmap：pmm_manager->init_memmap(base, n)
+    * pa2page(begin)：返回物理地址对应的page结构中对应的page
+
+    ```
+    static inline struct Page *
+    pa2page(uintptr_t pa) {
+        if (PPN(pa) >= npage) {
+            panic("pa2page called with invalid pa");
+        }
+        return &pages[PPN(pa)];
+    }
+    ```
+
+PPN表示是第几个页
+
+    ```
+    // page number field of address
+    #define PPN(la) (((uintptr_t)(la)) >> PTXSHIFT)
+    ```
+
+3. boot_pgdir = boot_alloc_page()
+    
+    创建boot_pgdir、初始的页目录表
+    return value: the kernel virtual address of this allocated page
+
+    ```
+    static void *
+    boot_alloc_page(void) {
+        //分配一页，但未映射实际的内存空间
+        struct Page *p = alloc_page();
+        if (p == NULL) {
+            panic("boot_alloc_page failed.\n");
+        }
+        return page2kva(p);
+    }
+    ```
+
+    page2kva返回页的虚拟地址
+
+    ```
+    static inline void *
+    page2kva(struct Page *page) {
+        return KADDR(page2pa(page));
+    }
+    ```
+
+    最终boot_pgdir实际上值等于free_mem的虚拟地址
+
+4. memset(boot_pgdir, 0, PGSIZE)
+    
+    基于boot_pgdir，初始化一个页大小的空间，用于页目录表，也即初始化页目录表
+
+
+5. boot_cr3 = PADDR(boot_pgdir)
+
+    boot_cr3为boot_pgdir所表示的内核虚拟地址的物理地址
+
+6. boot_pgdir[PDX(VPT)] = PADDR(boot_pgdir) | PTE_P | PTE_W
+
+    自映射机制
+
+7. boot_map_segment(boot_pgdir, KERNBASE, KMEMSIZE, 0, PTE_W)
+
+    建立物理地址和线性地址的一一映射的二级页表
+
+    ```
+    static void
+    boot_map_segment(pde_t *pgdir, uintptr_t la, size_t size, uintptr_t pa, uint32_t perm) {
+        assert(PGOFF(la) == PGOFF(pa));
+        //n为实际物理内存大小KMEMSIZE所能容纳的页数
+        size_t n = ROUNDUP(size + PGOFF(la), PGSIZE) / PGSIZE;
+        la = ROUNDDOWN(la, PGSIZE);
+        pa = ROUNDDOWN(pa, PGSIZE);
+        for (; n > 0; n --, la += PGSIZE, pa += PGSIZE) {
+            //实际上此步建立了物理地址和线性地址的映射
+            //因为未给la分配内存
+            pte_t *ptep = get_pte(pgdir, la, 1);
+            assert(ptep != NULL);
+            //二级页表项内填入虚拟地址对应的物理地址
+            *ptep = pa | PTE_P | perm;
+        }
+    }
+    ```
+
+    get_pte完成第一一级映射
+
+    ```
+    pte_t *
+    get_pte(pde_t *pgdir, uintptr_t la, bool create
+        pde_t *pdep = pgdir + PDX(la);   // (1) find page directory entry
+        if (!(*pdep & PTE_P)) {              // (2) check if entry is not present
+            struct Page *p;             // (3) check if creating is needed, then alloc page for page table
+            if(!create || (p = alloc_page()) == NULL) {
+                return NULL;
+            }
+            set_page_ref(p, 1);                  // (4) set page reference
+            //pa始终在page结构所占内存的空间之中
+            uintptr_t pa = page2pa(p);          // (5) get linear address of page
+            //此处即在虚拟内核地址处分配内存
+            //KADDR为物理地址和内核虚拟地址的转换关系，此处为virt addr = phy addr + 0xC0000000
+            memset(KADDR(pa), 0, PGSIZE);                           // (6) clear page content using memset
+            *pdep = pa | PTE_P | PTE_W | PTE_U;                         // (7) set page directory entry's permission
+        }
+        //此处KADDR(PDE_ADDR(*pdep))为KADDR(pa)，不同因为pa也许后12位不为0
+        return  &((pte_t *)KADDR(PDE_ADDR(*pdep)))[PTX(la)];         // (8) return page table entry
+    }
+    ```
+
+8. boot_pgdir[0] = boot_pgdir[PDX(KERNBASE)]
+
+    用来建立物理地址在0~4MB之内的三个地址间的临时映射关系 virt addr - 0xC0000000 = linear addr = phy addr
+    为下一步分页做准备，因为为了保持内核工作，需要virtual_addr 3G~3G+4M = linear_addr 0~4M = linear_addr 3G~3G+4M = phy_addr 0~4M
+
+9. enable_paging()
+    
+    使能分页
+
+    ```
+    static void
+    enable_paging(void) {
+        lcr3(boot_cr3);
+        // turn on paging
+        uint32_t cr0 = rcr0();
+        cr0 |= CR0_PE | CR0_PG | CR0_AM | CR0_WP | CR0_NE | CR0_TS | CR0_EM | CR0_MP;
+        cr0 &= ~(CR0_TS | CR0_EM);
+        lcr0(cr0);
+    }
+    ```
+
+
+10. gdt_init()
+	virtual_addr 0~4G=liear_addr 0~4G
+	then set kernel stack(ss:esp) in TSS, setup TSS in gdt, load TSS
+	```
+	    static void
+	    gdt_init(void) {	
+
+	        // set boot kernel stack and default SS0
+	        load_esp0((uintptr_t)bootstacktop);
+	        ts.ts_ss0 = KERNEL_DS;	
+
+	        // initialize the TSS filed of the gdt
+	        gdt[SEG_TSS] = SEGTSS(STS_T32A, (uintptr_t)&ts, sizeof(ts), DPL_KERNEL);	
+
+	        // reload all segment registers
+	        lgdt(&gdt_pd);	
+
+	        // load the TSS
+	        ltr(GD_TSS);
+	    }
+	```
+
+11. boot_pgdir[0] = 0
+    
+    disable the map of virtual_addr 0~4M
+
+## 一些问题
+
+1. 页目录表的起始虚地址是boot_pgdir 也就是 freemem对应的虚拟地址
+还是依照实验指导中的0xFAFEB000
+好像是有两个pde
+
+2. pages这个变量的地址到底是多少？
+
+# 虚拟内存管理
+
+## mm_struct vma_struct
+
+```
+struct mm_struct {
+    list_entry_t mmap_list;        // linear list link which sorted by start addr of vma
+    struct vma_struct *mmap_cache; // current accessed vma, used for speed purpose
+    pde_t *pgdir;                  // the PDT of these vma
+    int map_count;                 // the count of these vma
+    void *sm_priv;                 // the private data for swap manager
+    int mm_count;                  // the number ofprocess which shared the mm
+    lock_t mm_lock;                // mutex for using dup_mmap fun to duplicat the mm
+};
+```
+
+```
+struct vma_struct {
+    struct mm_struct *vm_mm; // the set of vma using the same PDT 
+    uintptr_t vm_start;      // start addr of vma      
+    uintptr_t vm_end;        // end addr of vma, not include the vm_end itself
+    uint32_t vm_flags;       // flags of vma
+    list_entry_t list_link;  // linear list link which sorted by start addr of vma
+};
+```
+
+vma涉及的操作
+* vma_create()
+* insert_vma_struct()
+* find_vma()
+
+mm涉及的操作
+* mm_create()
+* mm_destory()
+
+create操作都有kmalloc()
+mm_destroy()要对vma和mm都kfree()
+
+## 换入换出时机
+换入：产生pagefault
+换出：alloc_pages() == NULL
+
+## 换入需要解决的问题
+地址范围，权限，虚拟地址和硬盘的映射
+
+## 换出需要解决的问题
+换出算法
+
+## 何时发生pagefault
+
+分页机制启动后，
+* 一条指令或数据的虚拟地址对应的物理页框不在内存中
+    * 页表项全为0，即la与pa未建立映射
+    * 页表项非空，但present位=0，即不在内存中
+* 访问类型错误
+    * 页表项非空，present=1，但低权限访问高权限
+    * 写只读页面
+
+CR2是页故障线性地址寄存器，保存最后一次出现页故障的全32位线性地址
+
+## pagefault处理过程
+
+1. 保存现场
+2. 加载中断向量对应的中断服务例程地址
+3. 查找此地址是否在某个VMA的地址范围内
+4. 是否满足正确的读写权限，如果在此范围内并且权限也正确，这认为这是一次合法访问，但没有建立虚实对应关系。
+5. 所以需要分配一个空闲的内存页，并修改页表完成虚地址到物理地址的映射，刷新TLB，然后调用iret中断，返回到产生页访问异常的指令处重新执行此指令
+
+# 内核线程建立过程
+
+## 0号内核线程的建立
+
+kern_init()中
+
+```
+proc_init();                // init process table
+```
+
+
+在proc_init()中有这么几个关键的函数
+
+* alloc_proc()
+* kernel_thread(init_main, NULL, 0)
+* init_main()
+
+```
+void
+proc_init(void) {
+    int i;
+
+    list_init(&proc_list);
+    for (i = 0; i < HASH_LIST_SIZE; i ++) {
+        list_init(hash_list + i);
+    }
+
+    if ((idleproc = alloc_proc()) == NULL) {
+        panic("cannot alloc idleproc.\n");
+    }
+    //初始化idleproc，即0号内核线程
+    idleproc->pid = 0;
+    idleproc->state = PROC_RUNNABLE;
+    idleproc->kstack = (uintptr_t)bootstack;
+    idleproc->need_resched = 1;
+    set_proc_name(idleproc, "idle");
+    nr_process ++;
+
+    current = idleproc;
+    //建立1号线程
+    int pid = kernel_thread(init_main, NULL, 0);
+    if (pid <= 0) {
+        panic("create init_main failed.\n");
+    }
+
+    initproc = find_proc(pid);
+    set_proc_name(initproc, "init");
+
+    assert(idleproc != NULL && idleproc->pid == 0);
+    assert(initproc != NULL && initproc->pid == 1);
+}
+```
+
+至此，0号线程建立完毕。
+int pid = kernel_thread(init_main, NULL, 0)开始建立1号线程。
+
+alloc_proc()初始化一个完全空白的进程
+
+```
+static struct proc_struct *
+alloc_proc(void) {
+    struct proc_struct *proc = kmalloc(sizeof(struct proc_struct));
+    if (proc != NULL) {
+        proc->state = PROC_UNINIT;  //设置进程为“初始”态
+        proc->pid = -1;             //设置进程pid的未初始化值
+        proc->cr3 = boot_cr3;       //使用内核页目录表的基址
+        proc->runs = 0;
+        proc->kstack = 0;
+        proc->need_resched = 0;
+        proc->parent = NULL;
+        proc->mm = NULL;
+        memset(&(proc->context), 0, sizeof(struct context));
+        proc->tf = NULL;
+        proc->flags = 0;
+        memset(proc->name, 0, PROC_NAME_LEN);//进程名
+        proc->wait_state = 0;
+        proc->cptr=proc->yptr=proc->optr = NULL;     
+    }
+    return proc;
+}
+```
+
+## 1号内核线程的建立
+
+kern_thread()
+设置tf，通过do_fork产生新的线程
+
+```
+int
+kernel_thread(int (*fn)(void *), void *arg, uint32_t clone_flags) {
+    struct trapframe tf;
+    memset(&tf, 0, sizeof(struct trapframe));
+    tf.tf_cs = KERNEL_CS;
+    tf.tf_ds = tf.tf_es = tf.tf_ss = KERNEL_DS;
+    tf.tf_regs.reg_ebx = (uint32_t)fn;
+    tf.tf_regs.reg_edx = (uint32_t)arg;
+    tf.tf_eip = (uint32_t)kernel_thread_entry;
+    return do_fork(clone_flags | CLONE_VM, 0, &tf);
+}
+```
+
+因为是建立内核线程，中断帧的cs,ds,es,ss都为内核的段。
+kernel_thread_entry是entry.S的汇编函数
+
+```
+kernel_thread_entry: # void kernel_thread(void)
+pushl %edx # push arg
+call *%ebx # call fn
+pushl %eax # save the return value of fn(arg)
+call do_exit # call do_exit to terminate current thread
+```
+
+在1号线程建立的过程中，此处的fn为init_main()
+之后返回do_fork()的返回值
+
+do_fork()
+
+```
+int
+do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf) {
+    int ret = -E_NO_FREE_PROC;
+    struct proc_struct *proc;
+    if (nr_process >= MAX_PROCESS) {
+        goto fork_out;
+    }
+    ret = -E_NO_MEM;
+    //新建一个空白进程结构
+    if ((proc = alloc_proc()) == NULL) {
+        goto fork_out;
+    }
+    //设置空白进程的父进程为current
+    proc->parent = current;
+    assert(current->wait_state == 0);//确保当前进程正在等待
+    //分配内核栈
+    if (setup_kstack(proc) != 0) {
+        goto bad_fork_cleanup_kstack;
+    }
+    //调用copy_mm()函数复制父进程的内存信息到子进程
+    if (copy_mm(clone_flags, proc) != 0) {
+        goto bad_fork_cleanup_proc;
+    }
+    //调用copy_thread()函数复制父进程的中断帧和上下文信息
+    copy_thread(proc, stack, tf);
+    bool intr_flag;
+    local_intr_save(intr_flag);
+    {
+        proc->pid = get_pid();
+        hash_proc(proc); //建立映射
+        set_links(proc);//将原来简单的计数改成来执行set_links函数，从而实现设置进程的相关链接 
+    }
+    local_intr_restore(intr_flag);
+    //      7.一切就绪，唤醒子进程
+    wakeup_proc(proc);
+    //      8.返回子进程的pid
+    ret = proc->pid;
+
+fork_out:
+    return ret;
+
+bad_fork_cleanup_kstack:
+    put_kstack(proc);
+bad_fork_cleanup_proc:
+    kfree(proc);
+    goto fork_out;
+}
+```
+
+do_fork()主要工作：
+1. 进程控制块 alloc_proc()
+2. 内核栈 setup_kstack()
+3. 复制或共享内存管理结构mm copy_mm()
+4. 设置中断帧和进程上下文中的eip和esp copy_thread()
+5. 进程控制块加入链表
+6. 设置进程状态为就绪
+7. 返回pid
+
+copy_thread()
+
+```
+static void
+copy_thread(struct proc_struct *proc, uintptr_t esp, struct trapframe *tf) {
+    proc->tf = (struct trapframe *)(proc->kstack + KSTACKSIZE) - 1;
+    *(proc->tf) = *tf;
+    proc->tf->tf_regs.reg_eax = 0;
+    proc->tf->tf_esp = esp;
+    proc->tf->tf_eflags |= FL_IF;
+    proc->context.eip = (uintptr_t)forkret;
+    proc->context.esp = (uintptr_t)(proc->tf);
+}
+```
+
+forkret即kernel_thread()中的kernel_thread_entry，作为真正要调用的函数前的入口函数。
+至此两个线程都已经建立好。
+
+## 调度并执行init_proc
+
+schedule()
+
+```
+void
+schedule(void) {
+    bool intr_flag;
+    struct proc_struct *next;
+    local_intr_save(intr_flag);
+    {
+        current->need_resched = 0;
+        if (current->state == PROC_RUNNABLE) {
+            sched_class_enqueue(current);
+        }
+        if ((next = sched_class_pick_next()) != NULL) {
+            sched_class_dequeue(next);
+        }
+        if (next == NULL) {
+            next = idleproc;
+        }
+        next->runs ++;
+        if (next != current) {
+            proc_run(next);
+        }
+    }
+    local_intr_restore(intr_flag);
+}
+```
+
+1. 设置当前内核线程current->need_resched为0； 
+2. 在proc_list队列中查找下一个处于“就绪”态的线程或进程next； 
+3. 找到这样的进程后，就调用proc_run函数，保存当前进程current的执行现场（进程上下文），恢复新进程的执行现场，完成进
+程切换。
+
+proc_run()
+
+```
+void
+proc_run(struct proc_
+struct *proc) {
+    if (proc != current) {
+        bool intr_flag;
+        struct proc_struct *prev = current, *next = proc;
+        local_intr_save(intr_flag);
+        {
+            current = proc;
+            load_esp0(next->kstack + KSTACKSIZE);
+            lcr3(next->cr3);
+            switch_to(&(prev->context), &(next->context));
+        }
+        local_intr_restore(intr_flag);
+    }
+}
+```
+1. 让current指向next内核线程initproc；
+2. 设置任务状态段ts中特权态0下的栈顶指针esp0为next内核线程initproc的内核栈的栈顶，即next->kstack + KSTACKSIZE；
+3. 设置CR3寄存器的值为next内核线程initproc的页目录表起始地址next->cr3，这实际上是完成进程间的页表切换；
+4. 由switch_to函数完成具体的两个线程的执行现场切换，即切换各个寄存器，当switch_to函数执行完“ret”指令后，就切换到initproc执行了。
+
+```
+switch_to:                      # switch_to(from, to)
+    # save from's registers
+    movl 4(%esp), %eax          # eax points to from
+    popl 0(%eax)                # save eip !popl
+    movl %esp, 4(%eax)
+    movl %ebx, 8(%eax)
+    movl %ecx, 12(%eax)
+    movl %edx, 16(%eax)
+    movl %esi, 20(%eax)
+    movl %edi, 24(%eax)
+    movl %ebp, 28(%eax)
+
+    # restore to's registers
+    movl 4(%esp), %eax          # not 8(%esp): popped return address already
+                                # eax now points to to
+    movl 28(%eax), %ebp
+    movl 24(%eax), %edi
+    movl 20(%eax), %esi
+    movl 16(%eax), %edx
+    movl 12(%eax), %ecx
+    movl 8(%eax), %ebx
+    movl 4(%eax), %esp
+    pushl 0(%eax)               # push eip
+    ret
+```
+
+函数调用栈参数位置 + ret把栈顶的内容赋值给EIP
+在对initproc进行初始化时，设置了initproc->context.eip = (uintptr_t)forkret，这样，当执行switch_to函数并返回后，initproc将执行其实际上的执行入口地址forkret。
+而forkret会调用位于kern/trap/trapentry.S中的forkrets函数执行
+
+```
+.globl __trapret
+__trapret:
+# restore registers from stack
+popal
+# restore %ds and %es
+popl %es
+popl %ds
+# get rid of the trap number and error code
+addl $0x8, %esp
+iret
+.globl forkrets
+forkrets:
+# set stack to this new process's trapframe
+movl 4(%esp), %esp //把esp指向当前进程的中断帧
+jmp __trapret
+```
+
+iret -- kernel_thread_entry -- init_main -- do_exit
+
+
+调用alloc_proc，首先获得一块用户信息块。
+为进程分配一个内核栈。
+复制原进程的内存管理信息到新进程（但内核线程不必做此事）
+复制原进程上下文到新进程
+将新进程添加到进程列表
+唤醒新进程
+返回新进程号
+
+
+# 文件系统
+
+文件系统通常保存在硬盘上，当挂载后，文件系统信息将被记录在内存中
+SFS文件系统布局
+
+superblock  --  root-dir indode -- freemap -- inode/file data/dir data blocks
+
+超级块包含了文件系统的所有关键参数，当计算机被启动或文件系统被首次接触时，超级块的内容就会被装入内存
+root-dir的inode，记录根目录的相关信息
+freemap是bitmap，表示一个块占用情况
+其他目录和文件的inode信息和内容数据信息
+
+sfs_do_mount函数中，完成了加载位于硬盘上的SFS文件系统的超级块superblock和freemap的工作。这样，在内存中就有了SFS文件系统的全局信息。
+
+## SFS文件系统
+
+### 硬盘上的inode
+每一个磁盘索引节点代表了一个文件
+
+```
+struct sfs_disk_inode {
+	uint32_t size; 						//如果inode表示常规文件，则size是文件大小
+	uint16_t type;	 					//inode的文件类型
+	uint16_t nlinks; 					//此inode的硬链接数
+	uint32_t blocks; 					//此inode的数据块数的个数
+	uint32_t direct[SFS_NDIRECT]; 		//此inode的直接数据块索引值（有SFS_NDIRECT个）
+	uint32_t indirect; 					//此inode的一级间接数据块索引值
+};
+```
+
+ucore支持最大的文件大小为 12 * 4k + 1024 * 4k = 48k + 4m
+inode指向的数据块分为两类 普通文件和目录
+普通目录的数据块中 是 文件的数据
+目录的数据块中 是 目录下的文件名和其对应的inode占据的数据块的索引值
+
+```
+/* file entry (on disk) */
+struct sfs_disk_entry {
+	uint32_t ino; 索引节点所占数据块索引值
+	char name[SFS_MAX_FNAME_LEN + 1]; 文件名
+};
+```
+
+SFS 下，为了实现的简便（偷懒），每个 inode 直接用他所在的磁盘 block 的编号作为 inode 编号
+inode，sfs_dirent_entry 均占用一个 block
+
+### sfs中的inode
+
+```
+/* inode for sfs */
+struct sfs_inode {
+	struct sfs_disk_inode *din; 		/* on-disk inode */
+	uint32_t ino; 						/* inode number */
+	uint32_t flags; 					/* inode flags */
+	bool dirty; 						/* true if inode modified */
+	int reclaim_count; 					/* kill inode if it hits zero */
+	semaphore_t sem; 					/* semaphore for din */
+	list_entry_t inode_link; 			/* entry for linked-list in sfs_fs */
+	list_entry_t hash_link; 			/* entry for hash linked-list in sfs_fs */
+};
+```
+
+SFS中的内存inode包含了SFS的硬盘inode信息
+其他信息判断否改写、互斥操作、回收和快速地定位
+一个内存inode是在打开一个文件后才创建的，如果关机则相关信息都会消失。
+硬盘inode的内容是保存在硬盘中的，只是在进程需要时才被读入到内存中，用于访问文件或目录的具体内容数据为了方便实现上面提到的多级数据的访问以及目录中 entry 的操作
+
+### 内存中的inode
+
+```
+struct inode {
+    union {										//包含不同文件系统特定inode信息的union成员变量
+        struct device __device_info;			//设备文件系统内存inode信息
+        struct sfs_inode __sfs_inode_info;		//SFS文件系统内存inode信息
+    } in_info;
+    enum {
+        inode_type_device_info = 0x1234,
+        inode_type_sfs_inode_info,
+    } in_type;									//此inode所属文件系统类型
+    int ref_count;								//此inode的引用计数
+    int open_count;								//打开此inode对应文件的个数
+    struct fs *in_fs;							//抽象的文件系统，包含访问文件系统的函数指针
+    const struct inode_ops *in_ops;				//抽象的inode操作，包含访问inode的函数指针
+};
+```
+
+### inode操作函数inode_ops
+```
+// The sfs specific DIR operations correspond to the abstract operations on a inode.
+static const struct inode_ops sfs_node_dirops = {
+    .vop_magic                      = VOP_MAGIC,
+    .vop_open                       = sfs_opendir,
+    .vop_close                      = sfs_close,
+    .vop_fstat                      = sfs_fstat,
+    .vop_fsync                      = sfs_fsync,
+    .vop_namefile                   = sfs_namefile,
+    .vop_getdirentry                = sfs_getdirentry,
+    .vop_reclaim                    = sfs_reclaim,
+    .vop_gettype                    = sfs_gettype,
+    .vop_lookup                     = sfs_lookup,
+};
+// The sfs specific FILE operations correspond to the abstract operations on a inode.
+static const struct inode_ops sfs_node_fileops = {
+    .vop_magic                      = VOP_MAGIC,
+    .vop_open                       = sfs_openfile,
+    .vop_close                      = sfs_close,
+    .vop_read                       = sfs_read,
+    .vop_write                      = sfs_write,
+    .vop_fstat                      = sfs_fstat,
+    .vop_fsync                      = sfs_fsync,
+    .vop_reclaim                    = sfs_reclaim,
+    .vop_gettype                    = sfs_gettype,
+    .vop_tryseek                    = sfs_tryseek,
+    .vop_truncate                   = sfs_truncfile,
+};
+```
+
+### 抽象的文件系统
+
+```
+struct fs {
+    union {
+        struct sfs_fs __sfs_info;                   
+    } fs_info;                                     // filesystem-specific data 
+    enum {
+        fs_type_sfs_info,
+    } fs_type;                                     // filesystem type 
+    int (*fs_sync)(struct fs *fs);                 // Flush all dirty buffers to disk 
+    struct inode *(*fs_get_root)(struct fs *fs);   // Return root inode of filesystem.
+    int (*fs_unmount)(struct fs *fs);              // Attempt unmount of filesystem.
+    void (*fs_cleanup)(struct fs *fs);             // Cleanup of filesystem.???
+};
+```
+
+file接口
+
+```
+struct file {
+	enum {
+		FD_NONE, FD_INIT, FD_OPENED, FD_CLOSED,	
+	} status; 				//访问文件的执行状态
+	bool readable; 			//文件是否可读
+	bool writable; 			//文件是否可写
+	int fd; 				//文件在filemap中的索引值
+	off_t pos; 				//访问文件的当前位置
+	struct inode *node; 	//该文件对应的内存inode指针
+	atomic_t open_count; 	//打开此文件的次数
+};
+```
+
+### 进程中的files_struct
+结构体中添加成员变量struct files_struct *filesp;
+
+```
+struct files_struct {
+    struct inode *pwd;      // inode of present working directory
+    struct file *fd_array;  // opened files array
+    int files_count;        // the number of opened files
+    semaphore_t files_sem;  // lock protect sem
+};
+```
+
+## 物理设备
+
+```
+struct device {
+	size_t d_blocks; 												//设备占用的数据块个数
+	size_t d_blocksize; 											//数据块的大小
+	int (*d_open)(struct device *dev, uint32_t open_flags); 		//打开设备的函数指针
+	int (*d_close)(struct device *dev); 							//关闭设备的函数指针
+	int (*d_io)(struct device *dev, struct iobuf *iob, bool write); //读写设备的函数指针
+	int (*d_ioctl)(struct device *dev, int op, void *data); 		//用ioctl方式控制设备的函数指针
+};
+```
+
+vfs_dev_t把device和inode联通起来
+
+```
+// device info entry in vdev_list
+typedef struct {
+	const char *devname;
+	struct inode *devnode;
+	struct fs *fs;
+	bool mountable;
+	list_entry_t vdev_link;
+} vfs_dev_t;
+```
+
+目前有三个设备文件
+stdin设备文件、stdout设备文件、disk0设备
+
+std_out
+
+```
+static void
+stdout_device_init(struct device *dev) {
+	dev->d_blocks = 0;
+	dev->d_blocksize = 1;
+	dev->d_open = stdout_open;
+	dev->d_close = stdout_close;
+	dev->d_io = stdout_io;
+	dev->d_ioctl = stdout_ioctl;
+}
+```
+
+std_in
+```
+static void
+stdin_device_init(struct device *dev) {
+	dev->d_blocks = 0;
+	dev->d_blocksize = 1;
+	dev->d_open = stdin_open;
+	dev->d_close = stdin_close;
+	dev->d_io = stdin_io;
+	dev->d_ioctl = stdin_ioctl;
+	p_rpos = p_wpos = 0;
+	wait_queue_init(wait_queue);
+}
+```
